@@ -1,0 +1,661 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>GBS AI Request Portal</title>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #F5F4F0; color: #1a1a18; min-height: 100vh; }
+  input, select, textarea, button { font-family: inherit; font-size: 14px; border-radius: 8px; border: 0.5px solid #ccc; outline: none; background: #fff; color: #1a1a18; padding: 8px 10px; width: 100%; transition: border 0.15s; }
+  input:focus, select:focus, textarea:focus { border-color: #7F77DD; box-shadow: 0 0 0 3px rgba(127,119,221,0.15); }
+  button { width: auto; cursor: pointer; padding: 8px 16px; font-weight: 500; }
+  button:hover { background: #f1efe8; }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  button.primary { background: #EEEDFE; color: #3C3489; border-color: #AFA9EC; }
+  button.primary:hover { background: #CECBF6; }
+  select { appearance: none; background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24'%3E%3Cpath fill='%23888' d='M7 10l5 5 5-5z'/%3E%3C/svg%3E"); background-repeat: no-repeat; background-position: right 10px center; padding-right: 28px; }
+  textarea { resize: vertical; line-height: 1.5; }
+  .setup-banner { background: #FFF8E6; border-bottom: 0.5px solid #E8C96D; padding: 10px 1rem; font-size: 12px; color: #7A5C00; display: flex; align-items: flex-start; gap: 8px; }
+  .setup-banner code { background: rgba(0,0,0,0.07); padding: 1px 5px; border-radius: 4px; font-size: 11px; }
+  .setup-banner summary { cursor: pointer; font-weight: 500; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useRef, useEffect } = React;
+
+// ═══════════════════════════════════════════════════════════════════
+//  CONFIG — fill these in before deploying
+// ═══════════════════════════════════════════════════════════════════
+//
+//  SUPABASE — create a free project at https://supabase.com
+//  Then go to: Settings → API → copy Project URL + anon public key
+//
+const SUPABASE_URL  = "https://YOUR_PROJECT.supabase.co";
+const SUPABASE_ANON = "YOUR_ANON_KEY";
+//
+//  SUPABASE TABLE — run this SQL in your Supabase SQL editor:
+//  ┌──────────────────────────────────────────────────────────────┐
+//  │ create table tickets (                                        │
+//  │   id            bigint generated always as identity primary key, │
+//  │   name          text,                                         │
+//  │   description   text,                                         │
+//  │   priority      int,                                          │
+//  │   access        text,                                         │
+//  │   "dataSources" text,                                         │
+//  │   "painPoints"  text,                                         │
+//  │   workstream    text,                                         │
+//  │   "pointsOfContact" text,                                     │
+//  │   status        text default 'pending_review',                │
+//  │   rank          int,                                          │
+//  │   effort        text,                                         │
+//  │   created_at    timestamptz default now()                     │
+//  │ );                                                            │
+//  │ alter table tickets enable row level security;                │
+//  │ create policy "public read" on tickets for select using (true);│
+//  │ create policy "public insert" on tickets for insert with check (true); │
+//  │ create policy "public update" on tickets for update using (true); │
+//  └──────────────────────────────────────────────────────────────┘
+//
+//  OLLAMA — run locally before opening the portal:
+//    ollama serve
+//    ollama pull llama3.2
+//  Allow CORS from GitHub Pages:
+//    Windows: set OLLAMA_ORIGINS=* && ollama serve
+//    Mac/Linux: OLLAMA_ORIGINS=* ollama serve
+//
+const OLLAMA_MODEL = "llama3.2";
+const OLLAMA_URL   = "http://localhost:11434/api/chat";
+//
+//  ADMINS — usernames and passwords for the admin board
+//
+const ADMINS = [
+  { username: "ben.padget",         password: "12345" },
+  { username: "alexander.j.winter", password: "12345" },
+  { username: "diana.akolzina",     password: "12345" },
+];
+// ═══════════════════════════════════════════════════════════════════
+
+const WORKSTREAMS    = ["GBS","Controls/Engineering","IIP","BP&F","WSaaS","PMaaS","Maximo AMS","Cost Ecosystem","EHM","PMO"];
+const EFFORT_OPTIONS = ["XS (< 1 day)","S (1-3 days)","M (1-2 weeks)","L (1 month)","XL (> 1 month)"];
+const ACCESS_OPTIONS = ["Internal Only","External","Both"];
+
+// ── SUPABASE ─────────────────────────────────────────────────────
+const sbH = {
+  "Content-Type":  "application/json",
+  "apikey":        SUPABASE_ANON,
+  "Authorization": `Bearer ${SUPABASE_ANON}`,
+  "Prefer":        "return=representation",
+};
+async function dbFetch() {
+  const r = await fetch(`${SUPABASE_URL}/rest/v1/tickets?order=created_at.desc`, { headers: sbH });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+async function dbInsert(ticket) {
+  const r = await fetch(`${SUPABASE_URL}/rest/v1/tickets`, { method:"POST", headers:sbH, body:JSON.stringify(ticket) });
+  if (!r.ok) throw new Error(await r.text());
+  const d = await r.json(); return d[0];
+}
+async function dbUpdate(id, patch) {
+  const r = await fetch(`${SUPABASE_URL}/rest/v1/tickets?id=eq.${id}`, { method:"PATCH", headers:sbH, body:JSON.stringify(patch) });
+  if (!r.ok) throw new Error(await r.text());
+  const d = await r.json(); return d[0];
+}
+
+// ── OLLAMA AI REVIEWER ────────────────────────────────────────────
+async function runReviewer(ticket, history) {
+  const system = `You are a ticket reviewer for a GBS data & AI team. Evaluate submitted AI use case tickets for completeness.
+Priority (1-10) is ALWAYS set by humans — never challenge it. Effort is assessed by admins, not submitters.
+A good ticket must clearly explain: 1) Problem solved 2) Data sources 3) Who uses it 4) Workstream 5) Clear description.
+If anything is vague, ask ONE round of clarifying questions. When satisfied, approve.
+Respond in raw JSON only — no markdown: {"decision":"needs_info or approved","message":"text","questions":["q1"]}`;
+
+  const messages = [
+    { role:"system", content:system },
+    ...history,
+    { role:"user", content:`Review this ticket:\n\n${JSON.stringify(ticket, null, 2)}` },
+  ];
+
+  const res = await fetch(OLLAMA_URL, {
+    method:"POST",
+    headers:{ "Content-Type":"application/json" },
+    body:JSON.stringify({ model:OLLAMA_MODEL, messages, stream:false }),
+  });
+  if (!res.ok) throw new Error(`Ollama returned HTTP ${res.status}`);
+  const data = await res.json();
+  const raw   = data.message?.content || "";
+  const clean = raw.replace(/```json|```/g,"").trim();
+  const s = clean.indexOf("{"), e = clean.lastIndexOf("}");
+  return JSON.parse(s !== -1 ? clean.slice(s,e+1) : clean);
+}
+
+// ── UI HELPERS ────────────────────────────────────────────────────
+const STATUS_META = {
+  pending_review: { bg:"#FAEEDA", color:"#854F0B", label:"Pending review" },
+  needs_info:     { bg:"#FAECE7", color:"#993C1D", label:"Needs more info" },
+  approved:       { bg:"#EAF3DE", color:"#3B6D11", label:"Approved" },
+  prioritized:    { bg:"#EEEDFE", color:"#3C3489", label:"Prioritized" },
+};
+function Badge({ status }) {
+  const s = STATUS_META[status] || { bg:"#eee", color:"#555", label:status };
+  return <span style={{background:s.bg,color:s.color,fontSize:11,fontWeight:500,padding:"2px 9px",borderRadius:20}}>{s.label}</span>;
+}
+function Field({ label, required, help, children }) {
+  return (
+    <div style={{marginBottom:16}}>
+      <label style={{fontSize:13,fontWeight:500,display:"block",marginBottom:4}}>
+        {label}{required && <span style={{color:"#D85A30"}}> *</span>}
+      </label>
+      {help && <p style={{fontSize:12,color:"#888",margin:"0 0 4px"}}>{help}</p>}
+      {children}
+    </div>
+  );
+}
+const iS = { width:"100%", boxSizing:"border-box" };
+const tS = { ...iS, resize:"vertical", padding:"8px 10px", lineHeight:1.5 };
+
+// ── OLLAMA STATUS BANNER ──────────────────────────────────────────
+function OllamaBanner() {
+  const isHttps = location.protocol === "https:";
+  if (!isHttps) return null;
+  return (
+    <details className="setup-banner">
+      <summary>ℹ️ AI review requires Ollama running locally — click for setup</summary>
+      <div style={{marginTop:8,lineHeight:1.7}}>
+        1. Install Ollama: <a href="https://ollama.com" target="_blank" rel="noopener" style={{color:"#7A5C00"}}>ollama.com</a><br/>
+        2. Open a terminal and run:<br/>
+        <code>ollama pull llama3.2</code><br/>
+        3. Start with GitHub Pages CORS allowed:<br/>
+        <strong>Windows:</strong> <code>set OLLAMA_ORIGINS=* && ollama serve</code><br/>
+        <strong>Mac/Linux:</strong> <code>OLLAMA_ORIGINS=* ollama serve</code><br/>
+        <em style={{fontSize:11}}>If Ollama is offline, tickets are saved as "Pending review" for manual admin review.</em>
+      </div>
+    </details>
+  );
+}
+
+// ── TICKET FORM ───────────────────────────────────────────────────
+function TicketForm() {
+  const empty = { name:"", description:"", priority:"", access:"", dataSources:"", painPoints:"", workstream:"", pointsOfContact:"" };
+  const [form,    setForm]    = useState(empty);
+  const [phase,   setPhase]   = useState("form");     // form | reviewing | done
+  const [loading, setLoading] = useState(false);
+  const [agentMsg,setAgentMsg]= useState("");
+  const [questions,setQ]      = useState([]);
+  const [answers,  setA]      = useState({});
+  const [history,  setH]      = useState([]);
+  const [ollamaOk, setOllamaOk] = useState(null);    // null=unknown, true/false
+  const [err,      setErr]    = useState("");
+  const set = k => v => setForm(f => ({...f,[k]:v}));
+
+  function validate() {
+    for (const k of Object.keys(empty))
+      if (!form[k]?.toString().trim()) return `Please fill in: ${k.replace(/([A-Z])/g," $1").toLowerCase()}`;
+    const p = parseInt(form.priority);
+    if (isNaN(p)||p<1||p>10) return "Priority must be 1–10.";
+    return null;
+  }
+
+  async function submit() {
+    const e = validate(); if (e) { setErr(e); return; }
+    setErr(""); setLoading(true); setPhase("reviewing");
+    try {
+      const result = await runReviewer(form, []);
+      setOllamaOk(true);
+      setAgentMsg(result.message);
+      if (result.decision === "approved") await finalize("approved");
+      else { setQ(result.questions||[]); setH([{role:"assistant",content:result.message}]); }
+    } catch(err) {
+      setOllamaOk(false);
+      setAgentMsg(`⚠️ Could not reach Ollama (${err.message}).\n\nYour ticket has been saved for manual review by the admin team.`);
+      await finalize("pending_review");
+    }
+    setLoading(false);
+  }
+
+  async function sendAnswers() {
+    setLoading(true);
+    const ansText = questions.map(q=>`Q: ${q}\nA: ${answers[q]||""}`).join("\n\n");
+    const newH = [...history, {role:"user",content:ansText}];
+    try {
+      const result = await runReviewer(form, newH);
+      setAgentMsg(result.message);
+      if (result.decision === "approved") await finalize("approved");
+      else { setQ(result.questions||[]); setA({}); setH([...newH,{role:"assistant",content:result.message}]); }
+    } catch(err) {
+      setAgentMsg(`⚠️ Ollama disconnected. Submitting for manual review.`);
+      await finalize("pending_review");
+    }
+    setLoading(false);
+  }
+
+  async function finalize(status) {
+    try {
+      await dbInsert({
+        ...form,
+        priority:   parseInt(form.priority),
+        status,
+        rank:       null,
+        effort:     null,
+        created_at: new Date().toISOString(),
+      });
+    } catch(e) { alert("Database error: " + e.message + "\n\nCheck SUPABASE_URL and SUPABASE_ANON in the config."); }
+    setPhase("done");
+  }
+
+  function reset() { setForm(empty); setPhase("form"); setH([]); setQ([]); setA({}); setAgentMsg(""); setOllamaOk(null); }
+
+  if (phase === "done") return (
+    <div style={{maxWidth:480,margin:"80px auto",textAlign:"center",padding:"0 1rem"}}>
+      <div style={{width:56,height:56,borderRadius:"50%",background:"#EAF3DE",display:"flex",alignItems:"center",justifyContent:"center",margin:"0 auto 16px",fontSize:28,color:"#3B6D11"}}>✓</div>
+      <h2 style={{fontSize:20,fontWeight:500,marginBottom:8}}>Request submitted</h2>
+      <p style={{color:"#666",marginBottom:24}}>
+        {ollamaOk === false
+          ? "Your ticket was saved for manual review — an admin will assess it shortly."
+          : "Your idea has been AI-reviewed and is queued for the team."}
+      </p>
+      <button className="primary" onClick={reset}>Submit another</button>
+    </div>
+  );
+
+  if (phase === "reviewing") return (
+    <div style={{maxWidth:560,margin:"40px auto",padding:"0 1rem"}}>
+      <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:20}}>
+        <div style={{width:28,height:28,borderRadius:6,background:"#EEEDFE",display:"flex",alignItems:"center",justifyContent:"center"}}>🤖</div>
+        <span style={{fontWeight:500,fontSize:14}}>AI Reviewer</span>
+        {loading && <span style={{fontSize:12,color:"#888"}}>Thinking…</span>}
+      </div>
+      {agentMsg && (
+        <div style={{background:ollamaOk===false?"#FAECE7":"#EEEDFE",borderRadius:10,padding:"1rem 1.25rem",marginBottom:20,whiteSpace:"pre-wrap"}}>
+          <p style={{margin:0,fontSize:14,color:ollamaOk===false?"#993C1D":"#3C3489",lineHeight:1.6}}>{agentMsg}</p>
+        </div>
+      )}
+      {questions.length > 0 && !loading && (
+        <div>
+          {questions.map((q,i) => (
+            <Field key={i} label={q} required>
+              <textarea style={tS} rows={2} value={answers[q]||""} onChange={e=>setA(a=>({...a,[q]:e.target.value}))}/>
+            </Field>
+          ))}
+          <button className="primary" onClick={sendAnswers} disabled={questions.some(q=>!answers[q]?.trim())}>
+            Submit answers →
+          </button>
+        </div>
+      )}
+      {loading && <p style={{color:"#888",fontSize:14}}>Reviewing…</p>}
+    </div>
+  );
+
+  return (
+    <div style={{maxWidth:640,margin:"40px auto",padding:"0 1rem 60px"}}>
+      <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:20}}>
+        <div style={{width:32,height:32,borderRadius:8,background:"#EEEDFE",display:"flex",alignItems:"center",justifyContent:"center",fontSize:18}}>🎫</div>
+        <h1 style={{fontSize:20,fontWeight:500}}>New request</h1>
+      </div>
+      <div style={{background:"#fff",border:"0.5px solid #ddd",borderRadius:12,padding:"1.5rem",marginBottom:14}}>
+        <p style={{fontSize:11,color:"#888",textTransform:"uppercase",letterSpacing:"0.05em",marginBottom:16}}>Project details</p>
+        <Field label="Request name" required>
+          <input style={iS} value={form.name} onChange={e=>set("name")(e.target.value)} placeholder="e.g. PMO AI agent for sprint reporting"/>
+        </Field>
+        <Field label="Description" required>
+          <textarea style={tS} rows={4} value={form.description} onChange={e=>set("description")(e.target.value)} placeholder="What needs to be built and why?"/>
+        </Field>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
+          <Field label="Priority" required help="1 = lowest, 10 = highest">
+            <input style={iS} type="number" min={1} max={10} value={form.priority} onChange={e=>set("priority")(e.target.value)} placeholder="1–10"/>
+          </Field>
+          <Field label="Access" required>
+            <select style={iS} value={form.access} onChange={e=>set("access")(e.target.value)}>
+              <option value="">Select…</option>
+              {ACCESS_OPTIONS.map(o=><option key={o}>{o}</option>)}
+            </select>
+          </Field>
+        </div>
+        <Field label="Workstream" required>
+          <select style={iS} value={form.workstream} onChange={e=>set("workstream")(e.target.value)}>
+            <option value="">Select…</option>
+            {WORKSTREAMS.map(o=><option key={o}>{o}</option>)}
+          </select>
+        </Field>
+      </div>
+      <div style={{background:"#fff",border:"0.5px solid #ddd",borderRadius:12,padding:"1.5rem",marginBottom:14}}>
+        <p style={{fontSize:11,color:"#888",textTransform:"uppercase",letterSpacing:"0.05em",marginBottom:16}}>Context & ownership</p>
+        <Field label="Data sources" required>
+          <textarea style={tS} rows={2} value={form.dataSources} onChange={e=>set("dataSources")(e.target.value)} placeholder="Which systems, databases or datasets are involved?"/>
+        </Field>
+        <Field label="Pain points solved" required>
+          <textarea style={tS} rows={3} value={form.painPoints} onChange={e=>set("painPoints")(e.target.value)} placeholder="What problems or inefficiencies will this address?"/>
+        </Field>
+        <Field label="Points of contact" required>
+          <input style={iS} value={form.pointsOfContact} onChange={e=>set("pointsOfContact")(e.target.value)} placeholder="Team(s) or role(s) who own this request"/>
+        </Field>
+      </div>
+      {err && <p style={{color:"#D85A30",fontSize:13,marginBottom:12}}>{err}</p>}
+      <button className="primary" onClick={submit} disabled={loading} style={{width:"100%",padding:"10px"}}>
+        {loading ? "Submitting…" : "Submit for review →"}
+      </button>
+    </div>
+  );
+}
+
+// ── ADMIN LOGIN ───────────────────────────────────────────────────
+function AdminLogin({ onLogin }) {
+  const [u,setU] = useState(""), [p,setP] = useState(""), [err,setErr] = useState("");
+  function go() {
+    const a = ADMINS.find(x=>x.username===u&&x.password===p);
+    if (a) onLogin(a.username); else setErr("Invalid credentials.");
+  }
+  return (
+    <div style={{maxWidth:380,margin:"80px auto",padding:"0 1rem"}}>
+      <h1 style={{fontSize:20,fontWeight:500,marginBottom:24}}>Admin sign in</h1>
+      <div style={{background:"#fff",border:"0.5px solid #ddd",borderRadius:12,padding:"1.5rem"}}>
+        <Field label="Username" required>
+          <input style={iS} value={u} onChange={e=>setU(e.target.value)} placeholder="ben.padget" onKeyDown={e=>e.key==="Enter"&&go()}/>
+        </Field>
+        <Field label="Password" required>
+          <input style={iS} type="password" value={p} onChange={e=>setP(e.target.value)} placeholder="••••••••" onKeyDown={e=>e.key==="Enter"&&go()}/>
+        </Field>
+        {err && <p style={{color:"#D85A30",fontSize:13,marginBottom:12}}>{err}</p>}
+        <button className="primary" onClick={go} style={{width:"100%"}}>Sign in →</button>
+      </div>
+    </div>
+  );
+}
+
+// ── EDIT FORM ─────────────────────────────────────────────────────
+function EditForm({ ticket, onChange, onSave, onCancel }) {
+  const set = k => v => onChange(t=>({...t,[k]:v}));
+  return (
+    <div style={{marginTop:16,paddingTop:16,borderTop:"0.5px solid #eee"}}>
+      <p style={{fontSize:11,color:"#888",textTransform:"uppercase",letterSpacing:"0.05em",marginBottom:14}}>Edit ticket</p>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:4}}>
+        <Field label="Request name" required>
+          <input style={iS} value={ticket.name||""} onChange={e=>set("name")(e.target.value)}/>
+        </Field>
+        <Field label="Workstream">
+          <select style={iS} value={ticket.workstream||""} onChange={e=>set("workstream")(e.target.value)}>
+            <option value="">Select…</option>{WORKSTREAMS.map(o=><option key={o}>{o}</option>)}
+          </select>
+        </Field>
+        <Field label="Priority (1–10)">
+          <input style={iS} type="number" min={1} max={10} value={ticket.priority||""} onChange={e=>set("priority")(e.target.value)}/>
+        </Field>
+        <Field label="Effort (admin)">
+          <select style={iS} value={ticket.effort||""} onChange={e=>set("effort")(e.target.value)}>
+            <option value="">Select…</option>{EFFORT_OPTIONS.map(o=><option key={o}>{o}</option>)}
+          </select>
+        </Field>
+        <Field label="Status">
+          <select style={iS} value={ticket.status||""} onChange={e=>set("status")(e.target.value)}>
+            {Object.entries(STATUS_META).map(([v,{label}])=><option key={v} value={v}>{label}</option>)}
+          </select>
+        </Field>
+        <Field label="Points of contact">
+          <input style={iS} value={ticket.pointsOfContact||ticket.points_of_contact||""} onChange={e=>{set("pointsOfContact")(e.target.value);set("points_of_contact")(e.target.value);}}/>
+        </Field>
+      </div>
+      <Field label="Description">
+        <textarea style={tS} rows={3} value={ticket.description||""} onChange={e=>set("description")(e.target.value)}/>
+      </Field>
+      <Field label="Data sources">
+        <textarea style={tS} rows={2} value={ticket.dataSources||ticket.data_sources||""} onChange={e=>{set("dataSources")(e.target.value);set("data_sources")(e.target.value);}}/>
+      </Field>
+      <Field label="Pain points solved">
+        <textarea style={tS} rows={2} value={ticket.painPoints||ticket.pain_points||""} onChange={e=>{set("painPoints")(e.target.value);set("pain_points")(e.target.value);}}/>
+      </Field>
+      <div style={{display:"flex",gap:8,marginTop:4}}>
+        <button className="primary" onClick={()=>onSave(ticket)}>Save changes</button>
+        <button onClick={onCancel}>Cancel</button>
+      </div>
+    </div>
+  );
+}
+
+// ── ADMIN BOARD ───────────────────────────────────────────────────
+function AdminBoard({ adminUser, onLogout }) {
+  const [tickets, setTickets]   = useState([]);
+  const [loading, setLoading]   = useState(true);
+  const [dbError, setDbError]   = useState("");
+  const [selected,setSelected]  = useState(null);
+  const [editing, setEditing]   = useState(null);
+  const [filter,  setFilter]    = useState("all");
+  const [statusFilter, setStatusFilter] = useState("active");  // active | pending | all
+  const dragging = useRef(null);
+
+  useEffect(() => { refresh(); }, []);
+
+  async function refresh() {
+    setLoading(true);
+    try { const d = await dbFetch(); setTickets(d); setDbError(""); }
+    catch(e) { setDbError("Cannot connect to database. Check SUPABASE_URL and SUPABASE_ANON in the config at the top of index.html."); }
+    setLoading(false);
+  }
+
+  async function persist(id, patch) {
+    try {
+      await dbUpdate(id, patch);
+      setTickets(ts=>ts.map(t=>t.id===id?{...t,...patch}:t));
+    } catch(e) { alert("Save failed: "+e.message); }
+  }
+
+  async function saveEdit(t) { await persist(t.id, t); setEditing(null); setSelected(null); }
+
+  function onDrop(toId) {
+    const fromId = dragging.current; if (!fromId||fromId===toId) return;
+    const vis = getVisible();
+    const ids  = vis.map(t=>t.id);
+    const reordered = [...ids];
+    reordered.splice(reordered.indexOf(fromId),1);
+    reordered.splice(reordered.indexOf(toId),0,fromId);
+    reordered.forEach((id,i)=>persist(id,{rank:i+1,status:"prioritized"}));
+    setTickets(ts=>ts.map(t=>{const r=reordered.indexOf(t.id);return r===-1?t:{...t,rank:r+1,status:"prioritized"};}));
+    dragging.current = null;
+  }
+
+  function getVisible() {
+    return tickets
+      .filter(t => {
+        if (statusFilter === "active")  return t.status==="approved"||t.status==="prioritized";
+        if (statusFilter === "pending") return t.status==="pending_review"||t.status==="needs_info";
+        return true;
+      })
+      .filter(t => filter==="all"||t.workstream===filter)
+      .sort((a,b) => {
+        if (a.rank!==null&&b.rank!==null) return a.rank-b.rank;
+        if (a.rank!==null) return -1; if (b.rank!==null) return 1;
+        return new Date(b.created_at)-new Date(a.created_at);
+      });
+  }
+
+  const visible    = getVisible();
+  const workstreams = ["all",...Array.from(new Set(tickets.map(t=>t.workstream).filter(Boolean)))];
+  const pendingCount = tickets.filter(t=>t.status==="pending_review"||t.status==="needs_info").length;
+
+  return (
+    <div style={{maxWidth:960,margin:"0 auto",padding:"32px 1rem 60px"}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:28}}>
+        <div>
+          <h1 style={{fontSize:22,fontWeight:500,marginBottom:2}}>Prioritisation board</h1>
+          <p style={{color:"#888",fontSize:13}}>{adminUser}</p>
+        </div>
+        <div style={{display:"flex",gap:8}}>
+          <button onClick={refresh} style={{fontSize:13,padding:"6px 12px"}}>↺ Refresh</button>
+          <button onClick={onLogout} style={{fontSize:13,padding:"6px 12px"}}>Sign out</button>
+        </div>
+      </div>
+
+      {dbError && (
+        <div style={{background:"#FAECE7",border:"0.5px solid #F5C4B5",borderRadius:10,padding:"12px 16px",marginBottom:20,color:"#993C1D",fontSize:13}}>
+          ⚠️ {dbError}
+        </div>
+      )}
+
+      {/* Stats */}
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(140px,1fr))",gap:10,marginBottom:24}}>
+        {[
+          ["Total",      tickets.length],
+          ["Approved",   tickets.filter(t=>t.status==="approved"||t.status==="prioritized").length],
+          ["Ranked",     tickets.filter(t=>t.rank!==null).length],
+          ["Pending review", pendingCount],
+          ["Workstreams",new Set(tickets.map(t=>t.workstream).filter(Boolean)).size],
+        ].map(([l,v])=>(
+          <div key={l} style={{background:"#fff",border:"0.5px solid #ddd",borderRadius:10,padding:"12px 14px"}}>
+            <p style={{fontSize:12,color:"#888",marginBottom:4}}>{l}</p>
+            <p style={{fontSize:22,fontWeight:500,margin:0,color:l==="Pending review"&&v>0?"#854F0B":undefined}}>{v}</p>
+          </div>
+        ))}
+      </div>
+
+      {/* Status filter */}
+      <div style={{display:"flex",gap:8,marginBottom:12}}>
+        {[["active","Active"],["pending","Pending review"+( pendingCount>0?` (${pendingCount})`:""  )],["all","All"]].map(([v,l])=>(
+          <button key={v} onClick={()=>setStatusFilter(v)} style={{fontSize:12,padding:"4px 12px",background:statusFilter===v?"#EEEDFE":"#fff",color:statusFilter===v?"#534AB7":"inherit",border:statusFilter===v?"0.5px solid #AFA9EC":"0.5px solid #ddd"}}>{l}</button>
+        ))}
+      </div>
+
+      {/* Workstream filter */}
+      <div style={{display:"flex",gap:8,flexWrap:"wrap",marginBottom:20}}>
+        {workstreams.map(w=>(
+          <button key={w} onClick={()=>setFilter(w)} style={{fontSize:12,padding:"4px 12px",background:filter===w?"#f1efe8":"#fff",color:"inherit",border:filter===w?"0.5px solid #ccc":"0.5px solid #ddd"}}>
+            {w==="all"?"All":w}
+          </button>
+        ))}
+      </div>
+
+      {loading && <p style={{color:"#888",textAlign:"center",padding:"40px 0"}}>Loading…</p>}
+      {!loading&&visible.length===0&&!dbError && (
+        <div style={{textAlign:"center",padding:"60px 20px",color:"#aaa"}}>
+          <p style={{fontSize:28,marginBottom:8}}>📭</p>
+          <p>No tickets in this view.</p>
+        </div>
+      )}
+
+      <div style={{display:"flex",flexDirection:"column",gap:8}}>
+        {visible.map(t=>(
+          <div key={t.id}
+            draggable={t.status==="approved"||t.status==="prioritized"}
+            onDragStart={()=>dragging.current=t.id}
+            onDragOver={e=>e.preventDefault()}
+            onDrop={()=>onDrop(t.id)}
+            style={{background:"#fff",border:"0.5px solid #ddd",borderRadius:12,padding:"14px 16px",cursor:t.status==="approved"||t.status==="prioritized"?"grab":"default"}}>
+
+            <div style={{display:"flex",alignItems:"center",gap:12}}>
+              <span style={{fontSize:18,color:"#ccc",flexShrink:0}}>⠿</span>
+              <input type="number"
+                value={t.rank??""}
+                onChange={e=>persist(t.id,{rank:e.target.value===""?null:parseInt(e.target.value),status:"prioritized"})}
+                placeholder="—" min={1} onClick={e=>e.stopPropagation()}
+                style={{width:44,textAlign:"center",padding:"3px 4px",fontSize:13,fontWeight:500}}/>
+              <div style={{flex:1,minWidth:0}}>
+                <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap",marginBottom:2}}>
+                  <span style={{fontWeight:500,fontSize:14}}>{t.name}</span>
+                  <Badge status={t.status}/>
+                  {t.workstream && <span style={{fontSize:11,background:"#f1efe8",padding:"2px 8px",borderRadius:20,color:"#666"}}>{t.workstream}</span>}
+                </div>
+                <p style={{fontSize:12,color:"#888",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",margin:0}}>{t.description}</p>
+              </div>
+              <div style={{display:"flex",gap:14,flexShrink:0,alignItems:"center"}}>
+                <div style={{textAlign:"right"}}>
+                  <p style={{fontSize:11,color:"#888",margin:"0 0 1px"}}>Priority</p>
+                  <p style={{fontSize:15,fontWeight:500,margin:0}}>{t.priority}/10</p>
+                </div>
+                <div style={{textAlign:"right"}}>
+                  <p style={{fontSize:11,color:"#888",margin:"0 0 1px"}}>Effort</p>
+                  <p style={{fontSize:12,margin:0,color:t.effort?"inherit":"#ccc"}}>{t.effort?.split(" ")[0]||"TBD"}</p>
+                </div>
+                <button style={{fontSize:12,padding:"4px 10px"}} onClick={()=>{setEditing(null);setSelected(selected?.id===t.id?null:t);}}>
+                  {selected?.id===t.id&&!editing?"Close":"View"}
+                </button>
+                <button className="primary" style={{fontSize:12,padding:"4px 10px"}} onClick={e=>{e.stopPropagation();setSelected(null);setEditing(editing?.id===t.id?null:{...t});}}>
+                  {editing?.id===t.id?"Cancel":"Edit"}
+                </button>
+              </div>
+            </div>
+
+            {selected?.id===t.id&&!editing&&(
+              <div style={{marginTop:16,paddingTop:16,borderTop:"0.5px solid #eee"}}>
+                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"8px 24px",fontSize:13,marginBottom:12}}>
+                  {[["Access",t.access],["Workstream",t.workstream],["Effort (admin)",t.effort||"Not yet assessed"],["Priority",`${t.priority}/10`],["Points of contact",t.pointsOfContact||t.points_of_contact],["Submitted",new Date(t.created_at).toLocaleDateString()]].map(([k,v])=>(
+                    <div key={k}>
+                      <p style={{fontSize:11,color:"#888",textTransform:"uppercase",letterSpacing:"0.04em",margin:"0 0 1px"}}>{k}</p>
+                      <p style={{fontWeight:500,margin:0}}>{v||"—"}</p>
+                    </div>
+                  ))}
+                </div>
+                {[["Data sources",t.dataSources||t.data_sources],["Pain points solved",t.painPoints||t.pain_points],["Description",t.description]].map(([k,v])=>(
+                  <div key={k} style={{marginBottom:10}}>
+                    <p style={{fontSize:11,color:"#888",textTransform:"uppercase",letterSpacing:"0.04em",margin:"0 0 2px"}}>{k}</p>
+                    <p style={{fontSize:13,lineHeight:1.6,margin:0}}>{v||"—"}</p>
+                  </div>
+                ))}
+              </div>
+            )}
+            {editing?.id===t.id&&<EditForm ticket={editing} onChange={setEditing} onSave={saveEdit} onCancel={()=>setEditing(null)}/>}
+          </div>
+        ))}
+      </div>
+      {visible.length>0&&(statusFilter==="active")&&<p style={{fontSize:12,color:"#aaa",textAlign:"center",marginTop:20}}>Drag to reorder · type a rank number · changes sync to Supabase</p>}
+    </div>
+  );
+}
+
+// ── ROOT ──────────────────────────────────────────────────────────
+function App() {
+  const [view, setView]   = useState("home");
+  const [admin,setAdmin]  = useState(null);
+
+  if (view === "home") return (
+    <>
+      <OllamaBanner/>
+      <div style={{maxWidth:520,margin:"100px auto",padding:"0 1rem",textAlign:"center"}}>
+        <div style={{width:52,height:52,borderRadius:14,background:"#EEEDFE",display:"flex",alignItems:"center",justifyContent:"center",margin:"0 auto 16px",fontSize:26}}>🎫</div>
+        <h1 style={{fontSize:24,fontWeight:500,marginBottom:8}}>GBS AI Request Portal</h1>
+        <p style={{color:"#888",fontSize:14,marginBottom:32}}>Submit AI use case requests for the GBS Data &amp; AI team</p>
+        <div style={{display:"flex",gap:12,justifyContent:"center"}}>
+          <button className="primary" onClick={()=>setView("form")} style={{padding:"10px 24px"}}>Submit a request →</button>
+          <button onClick={()=>setView("admin-login")} style={{padding:"10px 24px"}}>Admin board</button>
+        </div>
+      </div>
+    </>
+  );
+
+  if (view === "form") return (
+    <>
+      <div style={{borderBottom:"0.5px solid #e5e5e5",padding:"10px 1rem",background:"#fff",display:"flex",alignItems:"center",gap:12}}>
+        <button onClick={()=>setView("home")} style={{fontSize:13,padding:"4px 10px"}}>← Home</button>
+        <OllamaBanner/>
+      </div>
+      <TicketForm/>
+    </>
+  );
+
+  if (view === "admin-login") return (
+    <>
+      <div style={{borderBottom:"0.5px solid #e5e5e5",padding:"10px 1rem",background:"#fff"}}>
+        <button onClick={()=>setView("home")} style={{fontSize:13,padding:"4px 10px"}}>← Home</button>
+      </div>
+      <AdminLogin onLogin={u=>{setAdmin(u);setView("admin-board");}}/>
+    </>
+  );
+
+  if (view === "admin-board"&&admin) return (
+    <>
+      <div style={{borderBottom:"0.5px solid #e5e5e5",padding:"10px 1rem",background:"#fff"}}>
+        <button onClick={()=>setView("home")} style={{fontSize:13,padding:"4px 10px"}}>← Home</button>
+      </div>
+      <AdminBoard adminUser={admin} onLogout={()=>{setAdmin(null);setView("home");}}/>
+    </>
+  );
+  return null;
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>
