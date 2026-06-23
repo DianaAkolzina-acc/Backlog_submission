@@ -165,25 +165,6 @@ function Field({ label, required, help, children }) {
 const iS = { width:"100%", boxSizing:"border-box" };
 const tS = { ...iS, resize:"vertical", padding:"8px 10px", lineHeight:1.5 };
 
-// ── OLLAMA STATUS BANNER ──────────────────────────────────────────
-function OllamaBanner() {
-  const isHttps = location.protocol === "https:";
-  if (!isHttps) return null;
-  return (
-    <details className="setup-banner">
-      <summary>ℹ️ AI review requires Ollama running locally — click for setup</summary>
-      <div style={{marginTop:8,lineHeight:1.7}}>
-        1. Install Ollama: <a href="https://ollama.com" target="_blank" rel="noopener" style={{color:"#7A5C00"}}>ollama.com</a><br/>
-        2. Open a terminal and run:<br/>
-        <code>ollama pull llama3.2</code><br/>
-        3. Start with GitHub Pages CORS allowed:<br/>
-        <strong>Windows:</strong> <code>set OLLAMA_ORIGINS=* && ollama serve</code><br/>
-        <strong>Mac/Linux:</strong> <code>OLLAMA_ORIGINS=* ollama serve</code><br/>
-        <em style={{fontSize:11}}>If Ollama is offline, tickets are saved as "Pending review" for manual admin review.</em>
-      </div>
-    </details>
-  );
-}
 
 // ── TICKET FORM ───────────────────────────────────────────────────
 function TicketForm() {
@@ -361,7 +342,7 @@ function AdminLogin({ onLogin }) {
       <h1 style={{fontSize:20,fontWeight:500,marginBottom:24}}>Admin sign in</h1>
       <div style={{background:"#fff",border:"0.5px solid #ddd",borderRadius:12,padding:"1.5rem"}}>
         <Field label="Username" required>
-          <input style={iS} value={u} onChange={e=>setU(e.target.value)} placeholder="ben.padget" onKeyDown={e=>e.key==="Enter"&&go()}/>
+          <input style={iS} value={u} onChange={e=>setU(e.target.value)} placeholder="admin" onKeyDown={e=>e.key==="Enter"&&go()}/>
         </Field>
         <Field label="Password" required>
           <input style={iS} type="password" value={p} onChange={e=>setP(e.target.value)} placeholder="••••••••" onKeyDown={e=>e.key==="Enter"&&go()}/>
@@ -615,26 +596,11 @@ function App() {
   const [view, setView]   = useState("home");
   const [admin,setAdmin]  = useState(null);
 
-  if (view === "home") return (
-    <>
-      <OllamaBanner/>
-      <div style={{maxWidth:520,margin:"100px auto",padding:"0 1rem",textAlign:"center"}}>
-        <div style={{width:52,height:52,borderRadius:14,background:"#EEEDFE",display:"flex",alignItems:"center",justifyContent:"center",margin:"0 auto 16px",fontSize:26}}>🎫</div>
-        <h1 style={{fontSize:24,fontWeight:500,marginBottom:8}}>GBS AI Request Portal</h1>
-        <p style={{color:"#888",fontSize:14,marginBottom:32}}>Submit AI use case requests for the GBS Data &amp; AI team</p>
-        <div style={{display:"flex",gap:12,justifyContent:"center"}}>
-          <button className="primary" onClick={()=>setView("form")} style={{padding:"10px 24px"}}>Submit a request →</button>
-          <button onClick={()=>setView("admin-login")} style={{padding:"10px 24px"}}>Admin board</button>
-        </div>
-      </div>
-    </>
-  );
 
   if (view === "form") return (
     <>
       <div style={{borderBottom:"0.5px solid #e5e5e5",padding:"10px 1rem",background:"#fff",display:"flex",alignItems:"center",gap:12}}>
         <button onClick={()=>setView("home")} style={{fontSize:13,padding:"4px 10px"}}>← Home</button>
-        <OllamaBanner/>
       </div>
       <TicketForm/>
     </>
