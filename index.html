@@ -367,14 +367,24 @@ function LoginScreen({ onLogin }) {
 
   async function verifyCode() {
     setLoading(true); setErr('');
-    const { error } = await supabaseClient.auth.verifyOtp({ email: email.trim().toLowerCase(), token: code.trim(), type: 'recovery' });
-    if (error) { setErr(error.message || 'Invalid or expired code.'); setLoading(false); return; }
-    for (let i = 0; i < 20; i++) {
-      const { data: { session } } = await supabaseClient.auth.getSession();
-      if (session) { onLogin(session); return; }
-      await new Promise(r => setTimeout(r, 500));
+    const e = email.trim().toLowerCase();
+    const t = code.trim();
+    let lastErr = null;
+    for (const type of ['email', 'recovery', 'magiclink']) {
+      const { error } = await supabaseClient.auth.verifyOtp({ email: e, token: t, type });
+      if (!error) {
+        for (let i = 0; i < 20; i++) {
+          const { data: { session } } = await supabaseClient.auth.getSession();
+          if (session) { onLogin(session); return; }
+          await new Promise(r => setTimeout(r, 500));
+        }
+        setErr('Verification timed out — please request a new code.');
+        setLoading(false);
+        return;
+      }
+      lastErr = error;
     }
-    setErr('Verification timed out — please request a new code.');
+    setErr(lastErr?.message || 'Invalid or expired code.');
     setLoading(false);
   }
 
