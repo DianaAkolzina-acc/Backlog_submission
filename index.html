@@ -86,13 +86,6 @@ let currentSession = null;
 //    Windows: set OLLAMA_ORIGINS=* && ollama serve
 //    Mac/Linux: OLLAMA_ORIGINS=* ollama serve
 //
-const OLLAMA_MODEL = "llama3.2";
-const OLLAMA_URL   = "http://localhost:11434/api/chat";
-// Ollama only runs on your local machine — disabled for all other origins.
-// To set your API key: open browser console and run:
-//   localStorage.setItem('ollama_api_key', 'your-key-here')
-const IS_LOCAL     = ["localhost", "127.0.0.1"].includes(window.location.hostname);
-const OLLAMA_KEY   = IS_LOCAL ? (localStorage.getItem("ollama_api_key") || "") : "";
 // ═══════════════════════════════════════════════════════════════════
 
 const WORKSTREAMS    = ["GBS","Controls/Engineering","IIP","BP&F","WSaaS","PMaaS","Maximo AMS","Cost Ecosystem","EHM","PMO"];
@@ -124,38 +117,6 @@ async function dbUpdate(id, patch) {
   const d = await r.json(); return d[0];
 }
 
-// ── OLLAMA AI REVIEWER ────────────────────────────────────────────
-async function runReviewer(ticket, history) {
-  if (!IS_LOCAL) throw new Error("Ollama is only available on localhost");
-
-  const system = `You are a ticket reviewer for a GBS data & AI team. Evaluate submitted AI use case tickets for completeness.
-Priority (1-10) is ALWAYS set by humans — never challenge it. Effort is assessed by admins, not submitters.
-A good ticket must clearly explain: 1) Problem solved 2) Data sources 3) Who uses it 4) Workstream 5) Clear description.
-If anything is vague, ask ONE round of clarifying questions. When satisfied, approve.
-Respond in raw JSON only — no markdown: {"decision":"needs_info or approved","message":"text","questions":["q1"]}`;
-
-  const messages = [
-    { role:"system", content:system },
-    ...history,
-    { role:"user", content:`Review this ticket:\n\n${JSON.stringify(ticket, null, 2)}` },
-  ];
-
-  const headers = { "Content-Type":"application/json" };
-  if (OLLAMA_KEY) headers["Authorization"] = `Bearer ${OLLAMA_KEY}`;
-
-  const res = await fetch(OLLAMA_URL, {
-    method:"POST",
-    headers,
-    body:JSON.stringify({ model:OLLAMA_MODEL, messages, stream:false }),
-  });
-  if (!res.ok) throw new Error(`Ollama returned HTTP ${res.status}`);
-  const data = await res.json();
-  const raw   = data.message?.content || "";
-  const clean = raw.replace(/```json|```/g,"").trim();
-  const s = clean.indexOf("{"), e = clean.lastIndexOf("}");
-  return JSON.parse(s !== -1 ? clean.slice(s,e+1) : clean);
-}
-
 // ── UI HELPERS ────────────────────────────────────────────────────
 const STATUS_META = {
   pending_review: { bg:"#FAEEDA", color:"#854F0B", label:"Pending review" },
@@ -183,17 +144,176 @@ const tS = { ...iS, resize:"vertical", padding:"8px 10px", lineHeight:1.5 };
 
 
 // ── TICKET FORM ───────────────────────────────────────────────────
+function runChecks(f) {
+  const issues = [];
+  const desc  = f.description  || '';
+  const descL = desc.toLowerCase();
+  const painL = (f.painPoints  || '').toLowerCase();
+  const dataL = (f.dataSources || '').toLowerCase();
+  const nameL = (f.name        || '').toLowerCase();
+  const poc   = f.pointsOfContact || '';
+  const pri   = parseInt(f.priority) || 0;
+  const wc    = s => s.trim().split(/\s+/).filter(Boolean).length;
+  const has   = (s, arr) => arr.some(w => s.includes(w));
+
+  // ── Description ──────────────────────────────────────────────
+  if (wc(desc) < 40)
+    issues.push({ id:'desc_short',
+      q:`Your description is only ${wc(desc)} words. Please expand: what exactly needs to be built, how will it work, and what does the end result look like?` });
+
+  if (desc.split(/[.!?]+/).filter(p => p.trim().length > 10).length < 2)
+    issues.push({ id:'desc_sentences',
+      q:'Your description reads as a single sentence. Please break it into at least 2–3 clear points: (1) what to build, (2) how it works, (3) who benefits.' });
+
+  if (has(descL, ['things','stuff','etc.','and so on','kind of','sort of','somehow','something like that','various things','some things']))
+    issues.push({ id:'desc_vague',
+      q:'Your description uses vague language ("things", "stuff", "kind of", "etc."). Please be specific — what are these processes or items exactly?' });
+
+  if (!has(descL, ['user','team','person','people','staff','employee','analyst','manager','client','customer','who will','for the','used by','stakeholder']))
+    issues.push({ id:'desc_users',
+      q:'Who will use this solution? Please name the specific team(s) or role(s) who will interact with it day-to-day.' });
+
+  if (!has(descL, ['result','outcome','benefit','saving','reduc','improv','faster','automat','replac','elimin','generat','produc','output','deliver','enable','allow']))
+    issues.push({ id:'desc_outcome',
+      q:'What is the expected outcome? What changes after this is built? (e.g. "reduces reporting time from 2 hours to 5 minutes", "eliminates manual data entry for the finance team")' });
+
+  if (has(descL, ['tbd','n/a','to be determined','to be defined','will be added','will be decided','placeholder']))
+    issues.push({ id:'desc_placeholder',
+      q:'Your description contains placeholder text ("TBD", "N/A", etc.). Please replace these with the actual details — incomplete submissions are deprioritised.' });
+
+  if (has(descL, [' ai ',' ml ','machine learning','llm','chatbot','automation']) &&
+      !has(descL, ['chatbot','bot','classifier','predict','forecast','generat','summariz','extract','detect','recommend','translat','analyz','report','categor','rank','score','cluster','segment']))
+    issues.push({ id:'desc_ai_type',
+      q:'You mention AI/ML but the type of solution isn\'t clear. Is it a chatbot, predictive model, document summariser, anomaly detector, report generator, or classifier? Please specify.' });
+
+  if (has(descL, ['note:','please note','fyi','as discussed','as per','as mentioned','see attached','refer to']))
+    issues.push({ id:'desc_email_paste',
+      q:'Your description looks like it may have been pasted from an email. Please rewrite it directly as a project request describing what needs to be built.' });
+
+  // ── Name ─────────────────────────────────────────────────────
+  if (wc(f.name || '') < 4)
+    issues.push({ id:'name_short',
+      q:'The request name is too brief. Please make it more descriptive — aim for 4–8 words that clearly identify what is being requested (e.g. "Automated sprint report generator for PMO").' });
+
+  if (has(nameL, ['ai solution','ai tool','ai project','smart solution','intelligent system','automated system','automation tool','ai platform','digital transformation','innovation']) && wc(f.name||'') < 5)
+    issues.push({ id:'name_buzzword',
+      q:'The name uses generic buzzwords without describing what the tool actually does. Please rename it to reflect its specific function (e.g. "AI contract review for Legal team" not "AI solution").' });
+
+  // ── Pain points ───────────────────────────────────────────────
+  if (wc(f.painPoints || '') < 30)
+    issues.push({ id:'pain_short',
+      q:`The pain points section is only ${wc(f.painPoints||'')} words. Please describe the current problem in more detail: what breaks down, how often, and what are the consequences?` });
+
+  if (!has(painL, ['hour','day','week','month','%','percent','cost','budget','revenue','error','manual','time','effort','resource','headcount','fte','delay','backlog','overtime']))
+    issues.push({ id:'pain_impact',
+      q:'Can you quantify the pain? E.g. "takes X hours per week", "X% error rate", "costs £X in manual effort", "delays reports by X days". Numbers make the business case far stronger.' });
+
+  if (has(painL, ['inefficient','time-consuming','manual process','tedious','slow','laborious']) && wc(f.painPoints||'') < 50)
+    issues.push({ id:'pain_vague',
+      q:'You\'ve said the process is manual/time-consuming — can you be more specific? What exact steps are manual, how long do they take, and what goes wrong when done manually?' });
+
+  // Overlap: description and pain points sharing too many words
+  const dWds = new Set(descL.split(/\W+/).filter(w => w.length > 5));
+  const pWds = new Set(painL.split(/\W+/).filter(w => w.length > 5));
+  const overlap = [...dWds].filter(w => pWds.has(w)).length;
+  if (dWds.size > 8 && pWds.size > 8 && overlap / Math.min(dWds.size, pWds.size) > 0.65)
+    issues.push({ id:'pain_repeat',
+      q:'Your pain points and description use very similar wording. Pain points = the problem; description = the solution. Please clearly separate these so reviewers can assess both independently.' });
+
+  // ── Data sources ──────────────────────────────────────────────
+  if (wc(f.dataSources || '') < 15)
+    issues.push({ id:'data_short',
+      q:'Please describe the data sources in more detail. Which specific systems, databases, or files will this solution read from or write to, and where are they hosted?' });
+
+  if (has(dataL, ['database','system','files','data','excel','spreadsheet','email','document']) &&
+      !has(dataL, ['sql','sap','salesforce','oracle','sharepoint','dynamics','servicenow','jira','powerbi','tableau','snowflake','azure','aws','api','warehouse','teams','power apps','.xlsx','.csv','sql server','postgres','mysql']))
+    issues.push({ id:'data_generic',
+      q:'Data sources are described generically ("database", "Excel", "system"). Please name the actual tools (e.g. "SAP PM module via BAPI", "SharePoint project tracker", "SQL Server reporting DB on Azure").' });
+
+  if (has(dataL, ['employee data','personal data','hr data','payroll','salary','patient','client data','customer data','pii','names','addresses']) &&
+      !has(dataL, ['gdpr','privacy','compliance','anonymis','pseudonymis','sensitive','consent','data protection','information security','ict approval','dpa']))
+    issues.push({ id:'data_pii',
+      q:'Your data sources appear to include personal or sensitive data. Have you considered GDPR/data privacy implications? Please note any data protection measures, approvals, or anonymisation steps in place.' });
+
+  if (has(dataL, ['real-time','live','stream','event-driven','kafka','pubsub','websocket']) &&
+      !has(dataL, ['latency','throughput','volume','rate','per second','per minute','frequency']))
+    issues.push({ id:'data_realtime',
+      q:'You mention real-time or streaming data. What is the expected data volume and frequency? (e.g. "~500 events/minute", "10 MB/hour") This is needed to size the solution correctly.' });
+
+  // ── Priority ──────────────────────────────────────────────────
+  if (pri >= 9)
+    issues.push({ id:'priority_max',
+      q:`You've set priority to ${pri}/10 — the highest level. What makes this critical right now? Please give a concrete reason (hard deadline, compliance requirement, client commitment, revenue at risk, executive escalation).` });
+
+  if (pri >= 7 && wc(desc) < 80)
+    issues.push({ id:'priority_high_short',
+      q:`Priority ${pri}/10 is high, but the description is only ${wc(desc)} words. High-priority requests need thorough descriptions to justify fast-tracking. Please expand it significantly.` });
+
+  if (pri >= 7 && !has(descL + painL, ['deadline','urgent','compliance','legal','regulat','revenue','client','contract','audit','breach','critical','blocking','escalat','sla','board','exec','regulatory','penalty','fine']))
+    issues.push({ id:'priority_justification',
+      q:`Priority is ${pri}/10 but no urgency driver is mentioned. What makes this high priority? (e.g. upcoming deadline, compliance risk, client commitment, revenue impact, exec pressure)` });
+
+  if (pri <= 2 && has(descL + painL, ['urgent','critical','asap','deadline','blocking','immediately','emergency','time-sensitive','must have']))
+    issues.push({ id:'priority_low_urgent',
+      q:'Your description uses urgency language ("urgent", "critical", "deadline") but priority is set very low. Is the priority correct, or should it be higher?' });
+
+  if (pri >= 8 && !has(descL + painL, ['by ','before ','quarter','q1','q2','q3','q4','jan','feb','mar','apr','may','jun','jul','aug','sep','oct','nov','dec','2025','2026','deadline','sprint','release']))
+    issues.push({ id:'priority_no_deadline',
+      q:`Priority ${pri}/10 is marked high. Is there a specific deadline or target date driving this? If so, please state it — it helps with scheduling.` });
+
+  // ── Access ────────────────────────────────────────────────────
+  if ((f.access === 'External' || f.access === 'Both') &&
+      !has(descL + painL, ['client','external','customer','vendor','partner','outside','third party','third-party','public','supplier','contractor']))
+    issues.push({ id:'access_external',
+      q:`You selected "${f.access}" access but the description doesn't mention external users. Who specifically outside Accenture will use this, and for what purpose?` });
+
+  if (f.access === 'Both' && !has(descL, ['internal','external','both','different','separate','two','role','permission','access level']))
+    issues.push({ id:'access_both',
+      q:'You selected "Both" (internal and external). How do the two use cases differ? Do internal and external users see different data or have different permissions?' });
+
+  // ── Points of contact ─────────────────────────────────────────
+  if (wc(poc) < 2)
+    issues.push({ id:'poc_short',
+      q:'Please provide at least a name and role, or a team name. Who should the admin team contact with questions about this request?' });
+
+  if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(poc.trim()))
+    issues.push({ id:'poc_email',
+      q:'The point of contact appears to be just an email address. Please provide a name and role/team instead (e.g. "Jane Smith, PMO Lead, GBS Controls").' });
+
+  if (wc(poc) <= 2 && !has(poc.toLowerCase(), ['team','group','lead','manager','director','head','owner','analyst','engineer','admin','department','chapter']))
+    issues.push({ id:'poc_no_role',
+      q:'The point of contact is a name without a role or team. Please add their role so we know who to escalate to if they\'re unavailable (e.g. "Jane Smith, PMO Lead, GBS Controls").' });
+
+  // ── Workstream alignment ──────────────────────────────────────
+  const wsMap = {
+    'GBS':                ['gbs','global business','shared service','gbs team'],
+    'Controls/Engineering':['control','engineer','compliance','governance','risk','audit','quality'],
+    'IIP':                ['iip','infrastructure','investment','programme'],
+    'BP&F':               ['bp&f','bp and f','budget','planning','finance','forecast','financial'],
+    'WSaaS':              ['wsaas','workspace','workplace','saas','tooling','collaboration'],
+    'PMaaS':              ['pmaas','project management','pmo','programme management','delivery'],
+    'Maximo AMS':         ['maximo','asset','maintenance','ams','facility','equipment'],
+    'Cost Ecosystem':     ['cost','pricing','spend','expense','billing','invoice','commercial'],
+    'EHM':                ['ehm','health','wellbeing','employee health','medical'],
+    'PMO':                ['pmo','project','portfolio','programme office','delivery office'],
+  };
+  const wsKw = wsMap[f.workstream] || [];
+  if (wsKw.length > 0 && !wsKw.some(w => (descL + painL).includes(w)))
+    issues.push({ id:'workstream_mismatch',
+      q:`You selected workstream "${f.workstream}" but the description doesn't clearly connect to it. Can you explain how this request fits within ${f.workstream}?` });
+
+  return issues;
+}
+
 function TicketForm() {
   const empty = { name:"", description:"", priority:"", access:"", dataSources:"", painPoints:"", workstream:"", pointsOfContact:"" };
   const [form,    setForm]    = useState(empty);
-  const [phase,   setPhase]   = useState("form");     // form | reviewing | done
+  const [phase,   setPhase]   = useState("form");  // form | questionnaire | submitting | done
   const [loading, setLoading] = useState(false);
-  const [agentMsg,setAgentMsg]= useState("");
-  const [questions,setQ]      = useState([]);
-  const [answers,  setA]      = useState({});
-  const [history,  setH]      = useState([]);
-  const [ollamaOk, setOllamaOk] = useState(null);    // null=unknown, true/false
-  const [err,      setErr]    = useState("");
+  const [err,     setErr]     = useState("");
+  const [checks,  setChecks]  = useState([]);
+  const [cAnswers,setCA]      = useState({});
+  const activeForm = useRef(null);
   const set = k => v => setForm(f => ({...f,[k]:v}));
 
   function validate() {
@@ -204,96 +324,87 @@ function TicketForm() {
     return null;
   }
 
+  async function finalize(f) {
+    try {
+      await dbInsert({ ...f, priority:parseInt(f.priority), status:'pending_review', rank:null, effort:null, created_at:new Date().toISOString() });
+    } catch(e) { alert("Database error: " + e.message); return false; }
+    return true;
+  }
+
   async function submit() {
     const e = validate(); if (e) { setErr(e); return; }
-    setErr(""); setLoading(true); setPhase("reviewing");
-    try {
-      const result = await runReviewer(form, []);
-      setOllamaOk(true);
-      setAgentMsg(result.message);
-      if (result.decision === "approved") await finalize("approved");
-      else { setQ(result.questions||[]); setH([{role:"assistant",content:result.message}]); }
-    } catch(err) {
-      setOllamaOk(false);
-      setAgentMsg(`⚠️ Could not reach Ollama (${err.message}).\n\nYour ticket has been saved for manual review by the admin team.`);
-      await finalize("pending_review");
-    }
-    setLoading(false);
+    setErr("");
+    const failed = runChecks(form);
+    if (failed.length > 0) { setChecks(failed); setCA({}); setPhase("questionnaire"); return; }
+    setLoading(true); setPhase("submitting");
+    await finalize(form);
+    setPhase("done"); setLoading(false);
   }
 
-  async function sendAnswers() {
+  async function submitWithAnswers() {
     setLoading(true);
-    const ansText = questions.map(q=>`Q: ${q}\nA: ${answers[q]||""}`).join("\n\n");
-    const newH = [...history, {role:"user",content:ansText}];
-    try {
-      const result = await runReviewer(form, newH);
-      setAgentMsg(result.message);
-      if (result.decision === "approved") await finalize("approved");
-      else { setQ(result.questions||[]); setA({}); setH([...newH,{role:"assistant",content:result.message}]); }
-    } catch(err) {
-      setAgentMsg(`⚠️ Ollama disconnected. Submitting for manual review.`);
-      await finalize("pending_review");
-    }
-    setLoading(false);
+    const qa = checks.map(c => `Q: ${c.q}\nA: ${cAnswers[c.id]||''}`).join('\n\n');
+    const enriched = { ...form, description: form.description + '\n\n[Clarifications provided]\n' + qa };
+    activeForm.current = enriched;
+    setPhase("submitting");
+    await finalize(enriched);
+    setPhase("done"); setLoading(false);
   }
 
-  async function finalize(status) {
-    try {
-      await dbInsert({
-        ...form,
-        priority:   parseInt(form.priority),
-        status,
-        rank:       null,
-        effort:     null,
-        created_at: new Date().toISOString(),
-      });
-    } catch(e) { alert("Database error: " + e.message + "\n\nCheck SUPABASE_URL and SUPABASE_ANON in the config."); }
-    setPhase("done");
-  }
+  function reset() { setForm(empty); setPhase("form"); setErr(""); setChecks([]); setCA({}); activeForm.current=null; }
 
-  function reset() { setForm(empty); setPhase("form"); setH([]); setQ([]); setA({}); setAgentMsg(""); setOllamaOk(null); }
-
+  // ── Done ──────────────────────────────────────────────────────
   if (phase === "done") return (
     <div style={{maxWidth:480,margin:"80px auto",textAlign:"center",padding:"0 1rem"}}>
       <div style={{width:56,height:56,borderRadius:"50%",background:"#EAF3DE",display:"flex",alignItems:"center",justifyContent:"center",margin:"0 auto 16px",fontSize:28,color:"#3B6D11"}}>✓</div>
       <h2 style={{fontSize:20,fontWeight:500,marginBottom:8}}>Request submitted</h2>
-      <p style={{color:"#666",marginBottom:24}}>
-        {ollamaOk === false
-          ? "Your ticket was saved for manual review — an admin will assess it shortly."
-          : "Your idea has been AI-reviewed and is queued for the team."}
-      </p>
+      <p style={{color:"#666",marginBottom:24}}>Your request is queued for review. The admin team will assess it and may follow up if more detail is needed.</p>
       <button className="primary" onClick={reset}>Submit another</button>
     </div>
   );
 
-  if (phase === "reviewing") return (
-    <div style={{maxWidth:560,margin:"40px auto",padding:"0 1rem"}}>
-      <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:20}}>
-        <div style={{width:28,height:28,borderRadius:6,background:"#EEEDFE",display:"flex",alignItems:"center",justifyContent:"center"}}>🤖</div>
-        <span style={{fontWeight:500,fontSize:14}}>AI Reviewer</span>
-        {loading && <span style={{fontSize:12,color:"#888"}}>Thinking…</span>}
-      </div>
-      {agentMsg && (
-        <div style={{background:ollamaOk===false?"#FAECE7":"#EEEDFE",borderRadius:10,padding:"1rem 1.25rem",marginBottom:20,whiteSpace:"pre-wrap"}}>
-          <p style={{margin:0,fontSize:14,color:ollamaOk===false?"#993C1D":"#3C3489",lineHeight:1.6}}>{agentMsg}</p>
-        </div>
-      )}
-      {questions.length > 0 && !loading && (
-        <div>
-          {questions.map((q,i) => (
-            <Field key={i} label={q} required>
-              <textarea style={tS} rows={2} value={answers[q]||""} onChange={e=>setA(a=>({...a,[q]:e.target.value}))}/>
-            </Field>
-          ))}
-          <button className="primary" onClick={sendAnswers} disabled={questions.some(q=>!answers[q]?.trim())}>
-            Submit answers →
-          </button>
-        </div>
-      )}
-      {loading && <p style={{color:"#888",fontSize:14}}>Reviewing…</p>}
+  // ── Submitting ────────────────────────────────────────────────
+  if (phase === "submitting") return (
+    <div style={{display:"flex",alignItems:"center",justifyContent:"center",minHeight:"60vh",color:"#888",fontSize:14}}>
+      Submitting…
     </div>
   );
 
+  // ── Questionnaire ─────────────────────────────────────────────
+  if (phase === "questionnaire") return (
+    <div style={{maxWidth:640,margin:"40px auto",padding:"0 1rem 60px"}}>
+      <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:20}}>
+        <div style={{width:28,height:28,borderRadius:6,background:"#FAEEDA",display:"flex",alignItems:"center",justifyContent:"center"}}>💬</div>
+        <span style={{fontWeight:500,fontSize:14}}>A few more details needed</span>
+        <span style={{fontSize:12,color:"#888",marginLeft:4}}>({checks.length} question{checks.length!==1?"s":""})</span>
+      </div>
+      <div style={{background:"#FFF8E6",border:"0.5px solid #E8C96D",borderRadius:10,padding:"12px 16px",marginBottom:20,fontSize:13,color:"#7A5C00"}}>
+        Your submission looks promising but needs a bit more context to be fast-tracked. Please answer the questions below — the more specific you are, the quicker it gets reviewed.
+      </div>
+      {checks.map((c,i) => (
+        <div key={c.id} style={{background:"#fff",border:"0.5px solid #ddd",borderRadius:12,padding:"1rem 1.25rem",marginBottom:12}}>
+          <label style={{fontSize:13,fontWeight:500,display:"block",marginBottom:8,lineHeight:1.5}}>
+            <span style={{color:"#aaa",marginRight:6,fontWeight:400}}>{i+1}.</span>{c.q}
+          </label>
+          <textarea style={tS} rows={3}
+            value={cAnswers[c.id]||""}
+            onChange={e=>setCA(a=>({...a,[c.id]:e.target.value}))}
+            placeholder="Please be specific…"/>
+        </div>
+      ))}
+      <div style={{display:"flex",gap:8,marginTop:8}}>
+        <button className="primary"
+          onClick={submitWithAnswers}
+          disabled={loading||checks.some(c=>!cAnswers[c.id]?.trim())}
+          style={{flex:1,padding:"10px"}}>
+          {loading?"Submitting…":"Submit with answers →"}
+        </button>
+        <button onClick={()=>setPhase("form")} style={{padding:"10px 16px"}}>← Edit form</button>
+      </div>
+    </div>
+  );
+
+  // ── Form ──────────────────────────────────────────────────────
   return (
     <div style={{maxWidth:640,margin:"40px auto",padding:"0 1rem 60px"}}>
       <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:20}}>
@@ -302,11 +413,11 @@ function TicketForm() {
       </div>
       <div style={{background:"#fff",border:"0.5px solid #ddd",borderRadius:12,padding:"1.5rem",marginBottom:14}}>
         <p style={{fontSize:11,color:"#888",textTransform:"uppercase",letterSpacing:"0.05em",marginBottom:16}}>Project details</p>
-        <Field label="Request name" required>
+        <Field label="Request name" required help="4–8 words, describe what is being built">
           <input style={iS} value={form.name} onChange={e=>set("name")(e.target.value)} placeholder="e.g. PMO AI agent for sprint reporting"/>
         </Field>
-        <Field label="Description" required>
-          <textarea style={tS} rows={4} value={form.description} onChange={e=>set("description")(e.target.value)} placeholder="What needs to be built and why?"/>
+        <Field label="Description" required help="What needs to be built, how it works, and who benefits">
+          <textarea style={tS} rows={5} value={form.description} onChange={e=>set("description")(e.target.value)} placeholder="Describe the solution, not the problem. Include: what to build, how it will work, who will use it, and the expected outcome."/>
         </Field>
         <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
           <Field label="Priority" required help="1 = lowest, 10 = highest">
@@ -328,19 +439,19 @@ function TicketForm() {
       </div>
       <div style={{background:"#fff",border:"0.5px solid #ddd",borderRadius:12,padding:"1.5rem",marginBottom:14}}>
         <p style={{fontSize:11,color:"#888",textTransform:"uppercase",letterSpacing:"0.05em",marginBottom:16}}>Context & ownership</p>
-        <Field label="Data sources" required>
-          <textarea style={tS} rows={2} value={form.dataSources} onChange={e=>set("dataSources")(e.target.value)} placeholder="Which systems, databases or datasets are involved?"/>
+        <Field label="Data sources" required help="Name the specific systems, databases, or files involved">
+          <textarea style={tS} rows={2} value={form.dataSources} onChange={e=>set("dataSources")(e.target.value)} placeholder="e.g. SAP PM module, SharePoint project tracker, SQL Server reporting DB"/>
         </Field>
-        <Field label="Pain points solved" required>
-          <textarea style={tS} rows={3} value={form.painPoints} onChange={e=>set("painPoints")(e.target.value)} placeholder="What problems or inefficiencies will this address?"/>
+        <Field label="Pain points solved" required help="Describe the problem — quantify where possible (hours/week, error rate, cost)">
+          <textarea style={tS} rows={3} value={form.painPoints} onChange={e=>set("painPoints")(e.target.value)} placeholder="What breaks down, how often, and what are the consequences? Include numbers if possible."/>
         </Field>
-        <Field label="Points of contact" required>
-          <input style={iS} value={form.pointsOfContact} onChange={e=>set("pointsOfContact")(e.target.value)} placeholder="Team(s) or role(s) who own this request"/>
+        <Field label="Points of contact" required help="Name + role + team (e.g. Jane Smith, PMO Lead, GBS Controls)">
+          <input style={iS} value={form.pointsOfContact} onChange={e=>set("pointsOfContact")(e.target.value)} placeholder="Who owns this request and can answer questions about it?"/>
         </Field>
       </div>
       {err && <p style={{color:"#D85A30",fontSize:13,marginBottom:12}}>{err}</p>}
       <button className="primary" onClick={submit} disabled={loading} style={{width:"100%",padding:"10px"}}>
-        {loading ? "Submitting…" : "Submit for review →"}
+        {loading?"Checking…":"Submit for review →"}
       </button>
     </div>
   );
