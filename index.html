@@ -28,8 +28,15 @@ Babel.registerPreset('jsx-classic', {
   .setup-banner code { background: rgba(0,0,0,0.07); padding: 1px 5px; border-radius: 4px; font-size: 11px; }
   .setup-banner summary { cursor: pointer; font-weight: 500; }
 </style>
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline' https://unpkg.com https://cdn.jsdelivr.net; style-src 'unsafe-inline'; connect-src https://ksxnjqimgiibifdyssgr.supabase.co https://cdn.jsdelivr.net; img-src 'self' data:; object-src 'none'; base-uri 'self';">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 </head>
 <body>
+<script>
+if(location.protocol!=='https:'&&!['localhost','127.0.0.1'].includes(location.hostname))location.replace('https:'+location.href.slice(location.protocol.length));
+if(top!==self)document.body.innerHTML='';
+</script>
 <div id="root"></div>
 <script type="text/babel" data-presets="jsx-classic">
 const { useState, useRef, useEffect } = React;
@@ -43,6 +50,11 @@ const { useState, useRef, useEffect } = React;
 //
 const SUPABASE_URL  = "https://ksxnjqimgiibifdyssgr.supabase.co";
 const SUPABASE_ANON = "sb_publishable_TQyLkKjpFW17BDHHz9eYkg_q5ZuMIRK";
+// ── AUTH ─────────────────────────────────────────────────────────
+const supabaseClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON, {
+  auth: { storage: window.sessionStorage, persistSession: true }
+});
+let currentSession = null;
 //
 //  SUPABASE TABLE — run this SQL in your Supabase SQL editor:
 //  ┌──────────────────────────────────────────────────────────────┐
@@ -76,14 +88,11 @@ const SUPABASE_ANON = "sb_publishable_TQyLkKjpFW17BDHHz9eYkg_q5ZuMIRK";
 //
 const OLLAMA_MODEL = "llama3.2";
 const OLLAMA_URL   = "http://localhost:11434/api/chat";
-//
-//  ADMINS — usernames and passwords for the admin board
-//
-const ADMINS = [
-  { username: "ben.padget",         password: "12345" },
-  { username: "alexander.j.winter", password: "12345" },
-  { username: "diana.akolzina",     password: "12345" },
-];
+// Ollama only runs on your local machine — disabled for all other origins.
+// To set your API key: open browser console and run:
+//   localStorage.setItem('ollama_api_key', 'your-key-here')
+const IS_LOCAL     = ["localhost", "127.0.0.1"].includes(window.location.hostname);
+const OLLAMA_KEY   = IS_LOCAL ? (localStorage.getItem("ollama_api_key") || "") : "";
 // ═══════════════════════════════════════════════════════════════════
 
 const WORKSTREAMS    = ["GBS","Controls/Engineering","IIP","BP&F","WSaaS","PMaaS","Maximo AMS","Cost Ecosystem","EHM","PMO"];
@@ -91,30 +100,34 @@ const EFFORT_OPTIONS = ["XS (< 1 day)","S (1-3 days)","M (1-2 weeks)","L (1 mont
 const ACCESS_OPTIONS = ["Internal Only","External","Both"];
 
 // ── SUPABASE ─────────────────────────────────────────────────────
-const sbH = {
-  "Content-Type":  "application/json",
-  "apikey":        SUPABASE_ANON,
-  "Authorization": `Bearer ${SUPABASE_ANON}`,
-  "Prefer":        "return=representation",
-};
+function authH() {
+  return {
+    "Content-Type":  "application/json",
+    "apikey":        SUPABASE_ANON,
+    "Authorization": `Bearer ${currentSession ? currentSession.access_token : SUPABASE_ANON}`,
+    "Prefer":        "return=representation",
+  };
+}
 async function dbFetch() {
-  const r = await fetch(`${SUPABASE_URL}/rest/v1/tickets?order=created_at.desc`, { headers: sbH });
+  const r = await fetch(`${SUPABASE_URL}/rest/v1/tickets?order=created_at.desc`, { headers: authH() });
   if (!r.ok) throw new Error(await r.text());
   return r.json();
 }
 async function dbInsert(ticket) {
-  const r = await fetch(`${SUPABASE_URL}/rest/v1/tickets`, { method:"POST", headers:sbH, body:JSON.stringify(ticket) });
+  const r = await fetch(`${SUPABASE_URL}/rest/v1/tickets`, { method:"POST", headers:authH(), body:JSON.stringify(ticket) });
   if (!r.ok) throw new Error(await r.text());
   const d = await r.json(); return d[0];
 }
 async function dbUpdate(id, patch) {
-  const r = await fetch(`${SUPABASE_URL}/rest/v1/tickets?id=eq.${id}`, { method:"PATCH", headers:sbH, body:JSON.stringify(patch) });
+  const r = await fetch(`${SUPABASE_URL}/rest/v1/tickets?id=eq.${id}`, { method:"PATCH", headers:authH(), body:JSON.stringify(patch) });
   if (!r.ok) throw new Error(await r.text());
   const d = await r.json(); return d[0];
 }
 
 // ── OLLAMA AI REVIEWER ────────────────────────────────────────────
 async function runReviewer(ticket, history) {
+  if (!IS_LOCAL) throw new Error("Ollama is only available on localhost");
+
   const system = `You are a ticket reviewer for a GBS data & AI team. Evaluate submitted AI use case tickets for completeness.
 Priority (1-10) is ALWAYS set by humans — never challenge it. Effort is assessed by admins, not submitters.
 A good ticket must clearly explain: 1) Problem solved 2) Data sources 3) Who uses it 4) Workstream 5) Clear description.
@@ -127,9 +140,12 @@ Respond in raw JSON only — no markdown: {"decision":"needs_info or approved","
     { role:"user", content:`Review this ticket:\n\n${JSON.stringify(ticket, null, 2)}` },
   ];
 
+  const headers = { "Content-Type":"application/json" };
+  if (OLLAMA_KEY) headers["Authorization"] = `Bearer ${OLLAMA_KEY}`;
+
   const res = await fetch(OLLAMA_URL, {
     method:"POST",
-    headers:{ "Content-Type":"application/json" },
+    headers,
     body:JSON.stringify({ model:OLLAMA_MODEL, messages, stream:false }),
   });
   if (!res.ok) throw new Error(`Ollama returned HTTP ${res.status}`);
@@ -330,25 +346,77 @@ function TicketForm() {
   );
 }
 
-// ── ADMIN LOGIN ───────────────────────────────────────────────────
-function AdminLogin({ onLogin }) {
-  const [u,setU] = useState(""), [p,setP] = useState(""), [err,setErr] = useState("");
-  function go() {
-    const a = ADMINS.find(x=>x.username===u&&x.password===p);
-    if (a) onLogin(a.username); else setErr("Invalid credentials.");
+// ── LOGIN SCREEN ──────────────────────────────────────────────────
+function LoginScreen({ onLogin }) {
+  const [step,    setStep]    = useState('email');
+  const [email,   setEmail]   = useState('');
+  const [code,    setCode]    = useState('');
+  const [msg,     setMsg]     = useState('');
+  const [err,     setErr]     = useState('');
+  const [loading, setLoading] = useState(false);
+
+  async function sendCode() {
+    const e = email.trim().toLowerCase();
+    if (!e.endsWith('@accenture.com')) { setErr('Only @accenture.com addresses are allowed.'); return; }
+    setLoading(true); setErr('');
+    const { error } = await supabaseClient.auth.signInWithOtp({ email: e });
+    if (error) { setErr('Could not send code. Please try again.'); }
+    else { setStep('code'); setMsg(`Code sent to ${e}`); }
+    setLoading(false);
   }
+
+  async function verifyCode() {
+    setLoading(true); setErr('');
+    const { error } = await supabaseClient.auth.verifyOtp({ email: email.trim().toLowerCase(), token: code.trim(), type: 'recovery' });
+    if (error) { setErr(error.message || 'Invalid or expired code.'); setLoading(false); return; }
+    for (let i = 0; i < 20; i++) {
+      const { data: { session } } = await supabaseClient.auth.getSession();
+      if (session) { onLogin(session); return; }
+      await new Promise(r => setTimeout(r, 500));
+    }
+    setErr('Verification timed out — please request a new code.');
+    setLoading(false);
+  }
+
+  const cardStyle = { background:'#fff', border:'0.5px solid #ddd', borderRadius:12, padding:'1.5rem' };
   return (
-    <div style={{maxWidth:380,margin:"80px auto",padding:"0 1rem"}}>
-      <h1 style={{fontSize:20,fontWeight:500,marginBottom:24}}>Admin sign in</h1>
-      <div style={{background:"#fff",border:"0.5px solid #ddd",borderRadius:12,padding:"1.5rem"}}>
-        <Field label="Username" required>
-          <input style={iS} value={u} onChange={e=>setU(e.target.value)} placeholder="admin" onKeyDown={e=>e.key==="Enter"&&go()}/>
-        </Field>
-        <Field label="Password" required>
-          <input style={iS} type="password" value={p} onChange={e=>setP(e.target.value)} placeholder="••••••••" onKeyDown={e=>e.key==="Enter"&&go()}/>
-        </Field>
-        {err && <p style={{color:"#D85A30",fontSize:13,marginBottom:12}}>{err}</p>}
-        <button className="primary" onClick={go} style={{width:"100%"}}>Sign in →</button>
+    <div style={{ maxWidth:400, margin:'80px auto', padding:'0 1rem' }}>
+      <div style={{ display:'flex', alignItems:'center', gap:10, marginBottom:20 }}>
+        <div style={{ width:32, height:32, borderRadius:8, background:'#EEEDFE', display:'flex', alignItems:'center', justifyContent:'center', fontSize:18 }}>🎫</div>
+        <h1 style={{ fontSize:20, fontWeight:500 }}>GBS AI Request Portal</h1>
+      </div>
+      <div style={cardStyle}>
+        {step === 'email' ? (
+          <>
+            <Field label="Accenture email" required help="@accenture.com addresses only">
+              <input style={iS} type="email" value={email} onChange={e=>setEmail(e.target.value)}
+                placeholder="you@accenture.com" autoComplete="email"
+                onKeyDown={e=>e.key==='Enter'&&sendCode()} />
+            </Field>
+            {err && <p style={{ color:'#D85A30', fontSize:13, marginBottom:12 }}>{err}</p>}
+            <button className="primary" onClick={sendCode} disabled={loading||!email} style={{ width:'100%' }}>
+              {loading ? 'Sending…' : 'Send sign-in code →'}
+            </button>
+          </>
+        ) : (
+          <>
+            <p style={{ fontSize:13, color:'#666', marginBottom:16 }}>{msg}</p>
+            <Field label="Sign-in code" required>
+              <input style={{ ...iS, fontSize:24, letterSpacing:6, textAlign:'center' }}
+                type="text" inputMode="numeric" value={code} onChange={e=>setCode(e.target.value)}
+                placeholder="········" autoComplete="one-time-code"
+                onKeyDown={e=>e.key==='Enter'&&verifyCode()} />
+            </Field>
+            {err && <p style={{ color:'#D85A30', fontSize:13, marginBottom:12 }}>{err}</p>}
+            <button className="primary" onClick={verifyCode} disabled={loading||code.length<4} style={{ width:'100%' }}>
+              {loading ? 'Verifying…' : 'Sign in →'}
+            </button>
+            <button onClick={()=>{ setStep('email'); setCode(''); setErr(''); }}
+              style={{ width:'100%', marginTop:8, background:'none', border:'none', color:'#888', fontSize:13, cursor:'pointer' }}>
+              Use a different email
+            </button>
+          </>
+        )}
       </div>
     </div>
   );
@@ -593,37 +661,73 @@ function AdminBoard({ adminUser, onLogout }) {
 
 // ── ROOT ──────────────────────────────────────────────────────────
 function App() {
-  const [view, setView]   = useState("home");
-  const [admin,setAdmin]  = useState(null);
+  const [session,     setSession]     = useState(null);
+  const [isAdmin,     setIsAdmin]     = useState(false);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [view,        setView]        = useState('main'); // main | form
 
+  useEffect(() => {
+    supabaseClient.auth.onAuthStateChange((event, s) => {
+      if (event === 'SIGNED_OUT') {
+        currentSession = null;
+        setSession(null);
+        setIsAdmin(false);
+        setView('main');
+      }
+    });
+    supabaseClient.auth.getSession().then(({ data: { session: s } }) => {
+      if (s) initSession(s);
+      else setAuthLoading(false);
+    });
+  }, []);
 
-  if (view === "form") return (
+  async function initSession(sess) {
+    currentSession = sess;
+    let admin = false;
+    try {
+      const { data } = await supabaseClient.from('user_roles').select('role').eq('user_id', sess.user.id).maybeSingle();
+      admin = data?.role === 'admin';
+    } catch(e) {}
+    setIsAdmin(admin);
+    setSession(sess);
+    setAuthLoading(false);
+  }
+
+  if (authLoading) return (
+    <div style={{ display:'flex', alignItems:'center', justifyContent:'center', minHeight:'100vh', color:'#888', fontSize:14 }}>
+      Loading…
+    </div>
+  );
+
+  if (!session) return <LoginScreen onLogin={initSession} />;
+
+  const navbar = (
+    <div style={{ borderBottom:'0.5px solid #e5e5e5', padding:'10px 1rem', background:'#fff', display:'flex', alignItems:'center', gap:8 }}>
+      {isAdmin && view === 'form' && (
+        <button onClick={()=>setView('main')} style={{ fontSize:13, padding:'4px 10px' }}>← Board</button>
+      )}
+      <div style={{ flex:1 }} />
+      <span style={{ fontSize:12, color:'#888' }}>{session.user.email}</span>
+      {isAdmin && view === 'main' && (
+        <button onClick={()=>setView('form')} style={{ fontSize:13, padding:'4px 10px' }}>+ Submit request</button>
+      )}
+      <button onClick={()=>supabaseClient.auth.signOut()} style={{ fontSize:13, padding:'4px 10px' }}>Sign out</button>
+    </div>
+  );
+
+  if (isAdmin && view === 'main') return (
     <>
-      <div style={{borderBottom:"0.5px solid #e5e5e5",padding:"10px 1rem",background:"#fff",display:"flex",alignItems:"center",gap:12}}>
-        <button onClick={()=>setView("home")} style={{fontSize:13,padding:"4px 10px"}}>← Home</button>
-      </div>
-      <TicketForm/>
+      {navbar}
+      <AdminBoard adminUser={session.user.email} onLogout={()=>supabaseClient.auth.signOut()} />
     </>
   );
 
-  if (view === "admin-login") return (
+  return (
     <>
-      <div style={{borderBottom:"0.5px solid #e5e5e5",padding:"10px 1rem",background:"#fff"}}>
-        <button onClick={()=>setView("home")} style={{fontSize:13,padding:"4px 10px"}}>← Home</button>
-      </div>
-      <AdminLogin onLogin={u=>{setAdmin(u);setView("admin-board");}}/>
+      {navbar}
+      <TicketForm />
     </>
   );
-
-  if (view === "admin-board"&&admin) return (
-    <>
-      <div style={{borderBottom:"0.5px solid #e5e5e5",padding:"10px 1rem",background:"#fff"}}>
-        <button onClick={()=>setView("home")} style={{fontSize:13,padding:"4px 10px"}}>← Home</button>
-      </div>
-      <AdminBoard adminUser={admin} onLogout={()=>{setAdmin(null);setView("home");}}/>
-    </>
-  );
-  return null;
 }
 
 ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
