@@ -51,8 +51,12 @@ const { useState, useRef, useEffect } = React;
 const SUPABASE_URL  = "https://ksxnjqimgiibifdyssgr.supabase.co";
 const SUPABASE_ANON = "sb_publishable_TQyLkKjpFW17BDHHz9eYkg_q5ZuMIRK";
 // ── AUTH ─────────────────────────────────────────────────────────
+const _storage = (() => {
+  try { sessionStorage.setItem('_t','1'); sessionStorage.removeItem('_t'); return sessionStorage; }
+  catch(e) { const s={}; return { getItem:k=>s[k]??null, setItem:(k,v)=>s[k]=v, removeItem:k=>delete s[k] }; }
+})();
 const supabaseClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON, {
-  auth: { storage: window.sessionStorage, persistSession: true }
+  auth: { storage: _storage, persistSession: true, flowType: 'implicit' }
 });
 let currentSession = null;
 //
